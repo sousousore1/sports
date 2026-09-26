@@ -22,9 +22,11 @@ from sports.annotators.handball import (
     draw_court,
     draw_paths_on_court,
     draw_points_on_court,
+    draw_projected_court,
 )
-from sports.common.view import ViewTransformer
 from sports.configs.handball import HandballCourtConfiguration
+from sports.handball.ball import HandballBallTracker
+from sports.handball.calibration import CourtCalibrator, inside_court
 
 
 PARENT_DIR = str(CURRENT_DIR)
@@ -65,6 +67,8 @@ BALL_ANNOTATOR = sv.CircleAnnotator(
     color=sv.Color.from_hex(TEAM_COLORS[2]),
     thickness=2,
 )
+PLAYER_CONFIDENCE_THRESHOLD = 0.35
+COURT_MARGIN_CM = 200.0
 
 
 class Mode(Enum):
@@ -112,17 +116,21 @@ def detection_class_ids(result, class_names: Set[str]) -> List[int]:
     ]
 
 
-def keypoint_correspondences(
+def keypoint_inputs(
     keypoints: sv.KeyPoints,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    court_vertices = np.array(CONFIG.vertices, dtype=np.float32)
-    detected_xy = keypoints.xy[0].astype(np.float32)
-    point_count = min(len(detected_xy), len(court_vertices))
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if len(keypoints) == 0 or keypoints.xy.size == 0:
+        return np.zeros((0, 2), dtype=np.float32), None
 
-    source = detected_xy[:point_count]
-    target = court_vertices[:point_count]
-    mask = (source[:, 0] > 1) & (source[:, 1] > 1)
-    return source[mask], target[mask], mask
+    best = 0
+    if keypoints.keypoint_confidence is not None and len(keypoints) > 1:
+        visible = keypoints.keypoint_confidence >= PLAYER_CONFIDENCE_THRESHOLD
+        best = int(np.argmax(visible.sum(axis=1)))
+
+    confidence = None
+    if keypoints.keypoint_confidence is not None:
+        confidence = keypoints.keypoint_confidence[best]
+    return keypoints.xy[best], confidence
 
 
 def write_video(
@@ -219,18 +227,30 @@ def run_court_detection(
 ) -> Iterator[np.ndarray]:
     court_detection_model = YOLO(model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    calibrator = CourtCalibrator(np.array(CONFIG.vertices, dtype=np.float32))
 
     for frame in frame_generator:
         result = court_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
-        label_count = min(len(CONFIG.labels), keypoints.xy.shape[1])
+        label_count = min(len(CONFIG.labels), keypoints.xy.shape[1] if keypoints.xy.ndim == 3 else 0)
+        image_xy, confidence = keypoint_inputs(keypoints)
+        projection = calibrator.update(image_xy, confidence)
 
         annotated_frame = frame.copy()
-        annotated_frame = VERTEX_LABEL_ANNOTATOR.annotate(
-            annotated_frame,
-            keypoints,
-            CONFIG.labels[:label_count],
-        )
+        if len(keypoints) > 0:
+            annotated_frame = VERTEX_LABEL_ANNOTATOR.annotate(
+                annotated_frame,
+                keypoints,
+                CONFIG.labels[:label_count],
+            )
+        if projection is not None:
+            annotated_frame = draw_projected_court(
+                annotated_frame,
+                CONFIG,
+                projection.court_to_image,
+                color=sv.Color.from_hex("#00FF87"),
+                thickness=2,
+            )
         yield annotated_frame
 
 
@@ -262,17 +282,24 @@ def run_ball_detection(
 ) -> Iterator[np.ndarray]:
     ball_detection_model = YOLO(model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    ball_tracker = HandballBallTracker()
+
+    def callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    slicer = sv.InferenceSlicer(
+        callback=callback,
+        overlap_filter=sv.OverlapFilter.NONE,
+        slice_wh=(640, 640),
+    )
 
     for frame in frame_generator:
-        result = ball_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        labels = labels_from_result(result)
+        detections = slicer(frame).with_nms(threshold=0.1)
+        detections = ball_tracker.update_detections(detections)
 
         annotated_frame = frame.copy()
         annotated_frame = BALL_ANNOTATOR.annotate(annotated_frame, detections)
-        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels=labels
-        )
         yield annotated_frame
 
 
@@ -285,15 +312,21 @@ def run_radar(
     player_detection_model = YOLO(player_model_path).to(device=device)
     court_detection_model = YOLO(court_model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    calibrator = CourtCalibrator(np.array(CONFIG.vertices, dtype=np.float32))
 
     for frame in frame_generator:
         court_result = court_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(court_result)
-        source, target, _ = keypoint_correspondences(keypoints)
+        image_xy, confidence = keypoint_inputs(keypoints)
+        projection = calibrator.update(image_xy, confidence)
 
         player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(player_result)
-        labels = labels_from_result(player_result)
+        if detections.confidence is not None:
+            detections = detections[detections.confidence >= PLAYER_CONFIDENCE_THRESHOLD]
+        labels = [
+            player_result.names[class_id] for class_id in detections.class_id
+        ]
 
         annotated_frame = frame.copy()
         annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
@@ -301,7 +334,7 @@ def run_radar(
             annotated_frame, detections, labels=labels
         )
 
-        if len(source) < 4:
+        if projection is None:
             yield annotated_frame
             continue
 
@@ -314,9 +347,15 @@ def run_radar(
             yield annotated_frame
             continue
 
-        transformer = ViewTransformer(source=source, target=target)
         xy = players.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
-        transformed_xy = transformer.transform_points(points=xy)
+        transformed_xy = projection.transform_points(points=xy)
+        on_court = inside_court(
+            transformed_xy,
+            CONFIG.length,
+            CONFIG.width,
+            margin_cm=COURT_MARGIN_CM,
+        )
+        transformed_xy = transformed_xy[on_court]
 
         radar = draw_court(config=CONFIG)
         radar = draw_points_on_court(
