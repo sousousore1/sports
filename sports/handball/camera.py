@@ -156,9 +156,29 @@ def camera_from_homography(
     )
 
 
-def _ground_point(image_to_court: np.ndarray, pixel: np.ndarray) -> np.ndarray:
-    point = np.array([[[float(pixel[0]), float(pixel[1])]]], dtype=np.float32)
-    return cv2.perspectiveTransform(point, image_to_court).reshape(2)
+def _ground_points(
+    image_to_court: np.ndarray,
+    pixels: np.ndarray,
+    front_pixel: np.ndarray,
+) -> np.ndarray:
+    """Project pixels onto z = 0. Pixels behind the camera become NaN.
+
+    The horizon is the image/floor intersection. Samples on the far side of
+    it are not part of the shooting range. ``front_pixel`` is a pixel on the
+    near floor, used only to fix the homography's sign.
+    """
+    pixels = np.asarray(pixels, dtype=np.float64).reshape(-1, 2)
+    matrix = np.asarray(image_to_court, dtype=np.float64)
+    front = np.array([float(front_pixel[0]), float(front_pixel[1]), 1.0])
+    if float(matrix[2] @ front) < 0:
+        matrix = -matrix
+    homo = np.hstack([pixels, np.ones((len(pixels), 1))])
+    mapped = (matrix @ homo.T).T
+    depth = mapped[:, 2]
+    ground = np.full((len(pixels), 2), np.nan, dtype=np.float64)
+    in_front = depth > 1e-9
+    ground[in_front] = mapped[in_front, :2] / depth[in_front, None]
+    return ground
 
 
 def visible_court_polygon(
@@ -187,15 +207,12 @@ def visible_court_polygon(
     edges.append(np.stack([xs[::-1], np.full_like(xs, height - 1)], axis=1))
     edges.append(np.stack([np.zeros_like(ys), ys[::-1]], axis=1))
     border = np.vstack(edges)
-    finite = []
+    ground = _ground_points(image_to_court, border, ((width - 1) / 2.0, height - 1))
     margin = max(float(config.length), float(config.width))
-    for pixel in border:
-        ground = _ground_point(image_to_court, pixel)
-        if not np.isfinite(ground).all():
-            continue
-        if abs(ground[0]) > margin * 3 or abs(ground[1]) > margin * 3:
-            continue
-        finite.append(ground)
+    finite = [
+        point for point in ground
+        if np.isfinite(point).all() and abs(point[0]) <= margin * 3 and abs(point[1]) <= margin * 3
+    ]
     if len(finite) < 3:
         return np.zeros((0, 2), dtype=np.float64)
     cloud = np.asarray(finite, dtype=np.float32)

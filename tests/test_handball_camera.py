@@ -58,6 +58,22 @@ class CourtCameraTest(unittest.TestCase):
         # The camera sits outside the near-left corner, so that corner is out of frame.
         self.assertGreater(np.min(np.linalg.norm(visible - np.array([0.0, CONFIG.width]), axis=1)), 80.0)
 
+    def test_pixels_past_the_horizon_do_not_fill_the_court(self):
+        camera = np.array([-470.0, 2350.0, 300.0])
+        target = np.array([90.0, 1130.0, 0.0])
+        homography = court_homography(
+            camera, look_at_rotation(camera, target), focal_px=1280.0, image_size=IMAGE_SIZE
+        )
+        visible = visible_court_polygon(homography, IMAGE_SIZE, CONFIG)
+        self.assertGreaterEqual(len(visible), 3)
+        area = _polygon_area(visible)
+        self.assertLess(area, float(CONFIG.length * CONFIG.width) * 0.85)
+        # The far end of the court is outside this frame.
+        self.assertGreater(
+            np.min(np.linalg.norm(visible - np.array([CONFIG.length, 0.0]), axis=1)),
+            200.0,
+        )
+
     def test_the_bottom_of_the_frame_is_closer_than_the_top(self):
         image_to_court = np.linalg.inv(_sideline_camera())
 
