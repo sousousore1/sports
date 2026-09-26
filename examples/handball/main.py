@@ -26,7 +26,16 @@ from sports.annotators.handball import (
 )
 from sports.configs.handball import HandballCourtConfiguration
 from sports.handball.ball import HandballBallTracker
-from sports.handball.calibration import CourtCalibrator, inside_court
+from sports.handball.calibration import CourtCalibrator
+from sports.handball.roster import (
+    FIELD_PLAYER,
+    GOALKEEPER,
+    REFEREE,
+    HandballRoster,
+    JerseyColorTeams,
+    normalize_kind,
+    torso_colors,
+)
 
 
 PARENT_DIR = str(CURRENT_DIR)
@@ -68,7 +77,6 @@ BALL_ANNOTATOR = sv.CircleAnnotator(
     thickness=2,
 )
 PLAYER_CONFIDENCE_THRESHOLD = 0.35
-COURT_MARGIN_CM = 200.0
 
 
 class Mode(Enum):
@@ -303,6 +311,16 @@ def run_ball_detection(
         yield annotated_frame
 
 
+def _track_label(track) -> str:
+    if track.kind == GOALKEEPER:
+        prefix = "GK"
+    elif track.kind == REFEREE:
+        prefix = "Ref"
+    else:
+        prefix = "P"
+    return f"{prefix}{track.track_id}"
+
+
 def run_radar(
     source_video_path: str,
     device: str,
@@ -313,6 +331,8 @@ def run_radar(
     court_detection_model = YOLO(court_model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
     calibrator = CourtCalibrator(np.array(CONFIG.vertices, dtype=np.float32))
+    roster = HandballRoster(CONFIG)
+    jerseys = JerseyColorTeams()
 
     for frame in frame_generator:
         court_result = court_detection_model(frame, verbose=False)[0]
@@ -324,48 +344,93 @@ def run_radar(
         detections = sv.Detections.from_ultralytics(player_result)
         if detections.confidence is not None:
             detections = detections[detections.confidence >= PLAYER_CONFIDENCE_THRESHOLD]
-        labels = [
-            player_result.names[class_id] for class_id in detections.class_id
-        ]
 
         annotated_frame = frame.copy()
-        annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
-        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels=labels
-        )
-
         if projection is None:
+            if len(detections):
+                labels = [
+                    player_result.names[class_id] for class_id in detections.class_id
+                ]
+                annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
+                annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+                    annotated_frame, detections, labels=labels
+                )
             yield annotated_frame
             continue
 
-        player_class_ids = detection_class_ids(
-            player_result, {"player", "goalkeeper"}
-        )
-        player_mask = np.isin(detections.class_id, player_class_ids)
-        players = detections[player_mask]
-        if len(players) == 0:
-            yield annotated_frame
-            continue
+        if len(detections) == 0:
+            kinds = []
+            teams = np.zeros((0,), dtype=int)
+            scores = np.zeros((0,), dtype=np.float64)
+            feet_court = np.zeros((0, 2), dtype=np.float64)
+            boxes = np.zeros((0, 4), dtype=np.float64)
+        else:
+            kinds = [
+                normalize_kind(player_result.names[int(class_id)])
+                for class_id in detections.class_id
+            ]
+            feet_image = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+            feet_court = projection.transform_points(points=feet_image)
+            boxes = detections.xyxy
+            if detections.confidence is None:
+                scores = np.ones(len(detections), dtype=np.float64)
+            else:
+                scores = np.asarray(detections.confidence, dtype=np.float64)
+            colors = torso_colors(frame, boxes)
+            field_colors = [
+                colors[index]
+                for index, kind in enumerate(kinds)
+                if kind == FIELD_PLAYER
+            ]
+            if field_colors:
+                jerseys.observe(np.stack(field_colors))
+            teams = jerseys.assign(colors)
+            for index, kind in enumerate(kinds):
+                if kind == REFEREE:
+                    teams[index] = -1
 
-        xy = players.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
-        transformed_xy = projection.transform_points(points=xy)
-        on_court = inside_court(
-            transformed_xy,
-            CONFIG.length,
-            CONFIG.width,
-            margin_cm=COURT_MARGIN_CM,
+        tracks = roster.update(
+            xyxy=boxes,
+            confidence=scores,
+            kind=kinds,
+            team_id=teams,
+            foot_court=feet_court,
+            court_to_image=projection.court_to_image,
         )
-        transformed_xy = transformed_xy[on_court]
+        visible = [track for track in tracks if track.confirmed or track.hits >= 2]
+        if visible:
+            boxes = np.stack([track.xyxy for track in visible]).astype(np.float32)
+            roster_detections = sv.Detections(
+                xyxy=boxes,
+                confidence=np.array([track.confidence for track in visible], dtype=np.float32),
+                class_id=np.array([
+                    track.team_id if track.team_id >= 0 else 2 for track in visible
+                ]),
+            )
+            annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, roster_detections)
+            annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+                annotated_frame,
+                roster_detections,
+                labels=[_track_label(track) for track in visible],
+            )
 
         radar = draw_court(config=CONFIG)
-        radar = draw_points_on_court(
-            config=CONFIG,
-            xy=transformed_xy,
-            face_color=sv.Color.from_hex(TEAM_COLORS[0]),
-            edge_color=sv.Color.WHITE,
-            radius=16,
-            court=radar,
-        )
+        for team_id, color in ((0, TEAM_COLORS[0]), (1, TEAM_COLORS[1])):
+            points = [
+                track.foot_court
+                for track in visible
+                if track.team_id == team_id and track.kind != REFEREE
+            ]
+            if not points:
+                continue
+            radar = draw_points_on_court(
+                config=CONFIG,
+                xy=np.array(points, dtype=np.float32),
+                face_color=sv.Color.from_hex(color),
+                edge_color=sv.Color.WHITE,
+                radius=16,
+                court=radar,
+            )
 
         h, w, _ = frame.shape
         radar = sv.resize_image(radar, (w // 2, h // 2))
