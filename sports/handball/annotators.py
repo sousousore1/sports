@@ -554,6 +554,77 @@ def _draw_projected_polyline(
     )
 
 
+def draw_visible_court(
+    config: HandballCourtConfiguration,
+    polygon: np.ndarray,
+    camera_xy: Optional[Tuple[float, float]] = None,
+    color: sv.Color = sv.Color.from_hex("#FF9800"),
+    padding: int = 50,
+    scale: float = 0.1,
+    court: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Draw the floor the camera can see, and the camera when it fits.
+
+    ``polygon`` is the shooting range in court centimetres. Its boundary is
+    where the image border meets the floor.
+    """
+    if court is None:
+        court = draw_court(config=config, padding=padding, scale=scale)
+    points = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    if len(points) < 3:
+        return court
+
+    bgr = color.as_bgr()
+    pixels = np.array(
+        [_to_pixel((float(point[0]), float(point[1])), scale, padding) for point in points],
+        dtype=np.int32,
+    )
+    overlay = court.copy()
+    cv2.fillPoly(overlay, [pixels.reshape(-1, 1, 2)], bgr)
+    cv2.addWeighted(overlay, 0.28, court, 0.72, 0, court)
+    _draw_dashed_closed(court, pixels, bgr, max(2, int(round(4 * scale / 0.1))))
+
+    if camera_xy is not None:
+        camera_px = _to_pixel((float(camera_xy[0]), float(camera_xy[1])), scale, padding)
+        height, width = court.shape[:2]
+        if 0 <= camera_px[0] < width and 0 <= camera_px[1] < height:
+            cv2.circle(court, camera_px, 7, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(court, camera_px, 7, bgr, 2, cv2.LINE_AA)
+    return court
+
+
+def _draw_dashed_closed(
+    image: np.ndarray,
+    pixels: np.ndarray,
+    color: Tuple[int, int, int],
+    thickness: int,
+    dash: int = 10,
+    gap: int = 7,
+) -> None:
+    if len(pixels) < 2:
+        return
+    closed = np.vstack([pixels, pixels[:1]]).astype(np.float64)
+    for start, end in zip(closed[:-1], closed[1:]):
+        length = float(np.linalg.norm(end - start))
+        if length < 1.0:
+            continue
+        direction = (end - start) / length
+        cursor = 0.0
+        while cursor < length:
+            stop = min(cursor + dash, length)
+            p0 = start + direction * cursor
+            p1 = start + direction * stop
+            cv2.line(
+                image,
+                (int(round(p0[0])), int(round(p0[1]))),
+                (int(round(p1[0])), int(round(p1[1]))),
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            cursor = stop + gap
+
+
 def draw_projected_court(
     image: np.ndarray,
     config: HandballCourtConfiguration,

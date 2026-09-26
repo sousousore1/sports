@@ -23,7 +23,9 @@ from sports.annotators.handball import (
     draw_paths_on_court,
     draw_points_on_court,
     draw_projected_court,
+    draw_visible_court,
 )
+from sports.handball.camera import camera_from_homography, visible_court_polygon
 from sports.configs.handball import HandballCourtConfiguration
 from sports.handball.ball import HandballBallTracker
 from sports.handball.calibration import CourtCalibrator
@@ -77,6 +79,9 @@ BALL_ANNOTATOR = sv.CircleAnnotator(
     thickness=2,
 )
 PLAYER_CONFIDENCE_THRESHOLD = 0.35
+RADAR_PADDING = 100
+RADAR_SCALE = 0.1
+READOUT_FONT = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
 
 
 class Mode(Enum):
@@ -303,6 +308,19 @@ def run_ball_detection(
         yield annotated_frame
 
 
+def _draw_readout(image: np.ndarray, text: str) -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        font = ImageFont.truetype(READOUT_FONT, 28)
+    except (ImportError, OSError):
+        return image
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    canvas = Image.fromarray(rgb)
+    ImageDraw.Draw(canvas).text((24, 16), text, font=font, fill=(255, 255, 255))
+    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+
+
 def _track_label(track) -> str:
     if track.kind == GOALKEEPER:
         prefix = "GK"
@@ -406,7 +424,24 @@ def run_radar(
                 labels=[_track_label(track) for track in visible],
             )
 
-        radar = draw_court(config=CONFIG)
+        h, w, _ = frame.shape
+        radar = draw_court(config=CONFIG, padding=RADAR_PADDING, scale=RADAR_SCALE)
+        try:
+            camera_pose = camera_from_homography(projection.court_to_image, (w, h))
+        except ValueError:
+            camera_pose = None
+        shooting_range = visible_court_polygon(
+            projection.court_to_image, (w, h), CONFIG
+        )
+        if len(shooting_range) >= 3:
+            radar = draw_visible_court(
+                config=CONFIG,
+                polygon=shooting_range,
+                camera_xy=None if camera_pose is None else (camera_pose.x_cm, camera_pose.y_cm),
+                padding=RADAR_PADDING,
+                scale=RADAR_SCALE,
+                court=radar,
+            )
         for team_id, color in ((0, TEAM_COLORS[0]), (1, TEAM_COLORS[1])):
             points = [
                 track.foot_court
@@ -421,10 +456,13 @@ def run_radar(
                 face_color=sv.Color.from_hex(color),
                 edge_color=sv.Color.WHITE,
                 radius=16,
+                padding=RADAR_PADDING,
+                scale=RADAR_SCALE,
                 court=radar,
             )
-
-        h, w, _ = frame.shape
+        if camera_pose is not None:
+            shown = sum(1 for track in visible if track.kind != REFEREE)
+            annotated_frame = _draw_readout(annotated_frame, camera_pose.readout(shown))
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
         rect = sv.Rect(
