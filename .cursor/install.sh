@@ -26,4 +26,10 @@ python -m pip install --upgrade pip setuptools wheel
 pip install -e .
 pip install -r examples/soccer/requirements.txt
 
+# The soccer example (examples/soccer/main.py) calls cv2.imshow, which requires
+# the GUI-enabled opencv-python build. Some dependencies (e.g. supervision) pull
+# in opencv-python-headless, and whichever shares the `cv2` files last wins, so
+# reinstall the GUI build last to keep imshow working (use xvfb for a display).
+pip install --force-reinstall --no-deps opencv-python
+
 echo "sports environment ready. Activate with: source .venv/bin/activate"
