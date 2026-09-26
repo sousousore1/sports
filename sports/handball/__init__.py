@@ -6,11 +6,17 @@ __all__ = [
     "draw_court",
     "draw_paths_on_court",
     "draw_points_on_court",
+    "draw_projected_court",
 ]
 
 
 def __getattr__(name):
-    if name in {"draw_court", "draw_paths_on_court", "draw_points_on_court"}:
+    if name in {
+        "draw_court",
+        "draw_paths_on_court",
+        "draw_points_on_court",
+        "draw_projected_court",
+    }:
         from sports.handball import annotators
 
         return getattr(annotators, name)

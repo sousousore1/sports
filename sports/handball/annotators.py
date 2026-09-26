@@ -56,74 +56,148 @@ def _draw_arc(
     )
 
 
-def _draw_dashed_line(
-    image: np.ndarray,
-    start: Tuple[int, int],
-    end: Tuple[int, int],
-    color: Tuple[int, int, int],
-    thickness: int,
+def _point_at_distance(
+    polyline: np.ndarray,
+    cumulative: np.ndarray,
+    distance: float,
+) -> np.ndarray:
+    distance = float(np.clip(distance, 0.0, cumulative[-1]))
+    index = int(np.searchsorted(cumulative, distance, side="right") - 1)
+    index = min(max(index, 0), len(polyline) - 2)
+    segment_length = float(cumulative[index + 1] - cumulative[index])
+    if segment_length <= 1e-12:
+        return polyline[index]
+    blend = (distance - cumulative[index]) / segment_length
+    return polyline[index] * (1.0 - blend) + polyline[index + 1] * blend
+
+
+def split_dashes(
+    polyline: np.ndarray,
     dash_length: float,
     gap_length: float,
-) -> None:
-    start_np = np.array(start, dtype=float)
-    end_np = np.array(end, dtype=float)
-    delta = end_np - start_np
-    length = float(np.linalg.norm(delta))
-    if length == 0:
-        return
+) -> List[np.ndarray]:
+    """Split a polyline into dashes measured along its arc length.
 
-    direction = delta / length
-    distance = 0.0
-    while distance < length:
-        dash_start = start_np + direction * distance
-        dash_end = start_np + direction * min(distance + dash_length, length)
-        cv2.line(
-            image,
-            tuple(np.round(dash_start).astype(int)),
-            tuple(np.round(dash_end).astype(int)),
-            color,
-            thickness,
-        )
-        distance += dash_length + gap_length
+    IHF free-throw segments and the spaces between them are each 15 cm.
+    Sampling an arc in 1 degree steps overshoots that length, so dashes are
+    cut from the cumulative distance instead.
+    """
+    if dash_length <= 0 or gap_length < 0:
+        raise ValueError("Dash length must be positive and gap length non-negative.")
+
+    points = np.asarray(polyline, dtype=float)
+    if len(points) < 2:
+        return []
+
+    segment_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    cumulative = np.concatenate([[0.0], np.cumsum(segment_lengths)])
+    total = float(cumulative[-1])
+    if total <= 1e-9:
+        return []
+
+    dashes = []
+    cursor = 0.0
+    while cursor < total - 1e-6:
+        dash_end = min(cursor + dash_length, total)
+        span = [_point_at_distance(points, cumulative, cursor)]
+        for index, distance in enumerate(cumulative):
+            if cursor + 1e-6 < distance < dash_end - 1e-6:
+                span.append(points[index])
+        span.append(_point_at_distance(points, cumulative, dash_end))
+        dashes.append(np.asarray(span, dtype=float))
+        cursor = dash_end + gap_length
+    return dashes
 
 
-def _draw_dashed_arc(
-    image: np.ndarray,
+def _sample_arc(
     center: Tuple[float, float],
     radius: float,
     start_degrees: float,
     end_degrees: float,
+    step_cm: float = 2.0,
+) -> np.ndarray:
+    sweep = abs(end_degrees - start_degrees)
+    arc_length = abs(np.deg2rad(sweep) * radius)
+    sample_count = max(2, int(np.ceil(arc_length / step_cm)) + 1)
+    angles = np.linspace(start_degrees, end_degrees, sample_count)
+    return np.asarray(
+        [_arc_point(center, radius, float(angle)) for angle in angles],
+        dtype=float,
+    )
+
+
+def _concatenate_polylines(parts: List[np.ndarray]) -> np.ndarray:
+    merged = [np.asarray(parts[0], dtype=float)]
+    for part in parts[1:]:
+        part = np.asarray(part, dtype=float)
+        if np.linalg.norm(merged[-1][-1] - part[0]) < 1e-3:
+            merged.append(part[1:])
+        else:
+            merged.append(part)
+    return np.vstack(merged)
+
+
+def free_throw_polyline(
+    config: HandballCourtConfiguration,
+    side: str,
+) -> np.ndarray:
+    """Sample one 9 m line from the top sideline to the bottom sideline.
+
+    The arc and the 3 m straight section share one path so the 15 cm dash
+    pattern does not restart at the junctions.
+    """
+    ratio = np.clip(config.goal_top_y / config.free_throw_radius, -1.0, 1.0)
+    sideline_angle = degrees(asin(float(ratio)))
+    if side == "left":
+        center_x = 0.0
+        top_angles = (360.0 - sideline_angle, 360.0)
+        bottom_angles = (0.0, sideline_angle)
+    elif side == "right":
+        center_x = float(config.length)
+        top_angles = (180.0 + sideline_angle, 180.0)
+        bottom_angles = (180.0, 180.0 - sideline_angle)
+    else:
+        raise ValueError("side must be 'left' or 'right'.")
+
+    top_center = (center_x, config.goal_top_y)
+    bottom_center = (center_x, config.goal_bottom_y)
+    direction = 1.0 if side == "left" else -1.0
+    straight_x = center_x + direction * config.free_throw_radius
+    straight = np.array([
+        [straight_x, config.goal_top_y],
+        [straight_x, config.goal_bottom_y],
+    ], dtype=float)
+    return _concatenate_polylines([
+        _sample_arc(top_center, config.free_throw_radius, *top_angles),
+        straight,
+        _sample_arc(bottom_center, config.free_throw_radius, *bottom_angles),
+    ])
+
+
+def _draw_dashed_polyline(
+    image: np.ndarray,
+    polyline: np.ndarray,
     color: Tuple[int, int, int],
     thickness: int,
     scale: float,
     padding: int,
     dash_length: float,
     gap_length: float,
-    detail_degrees: float = 1,
 ) -> None:
-    dash_length_degrees = degrees(dash_length / radius)
-    gap_length_degrees = degrees(gap_length / radius)
-    angle = start_degrees
-    while angle < end_degrees:
-        dash_end = min(angle + dash_length_degrees, end_degrees)
-        samples = np.arange(angle, dash_end + detail_degrees, detail_degrees)
-        points = np.array(
-            [
-                _to_pixel(_arc_point(center, radius, sample), scale, padding)
-                for sample in samples
-            ],
+    for dash in split_dashes(polyline, dash_length, gap_length):
+        pixels = np.array(
+            [_to_pixel((float(point[0]), float(point[1])), scale, padding) for point in dash],
             dtype=np.int32,
         )
-        if len(points) >= 2:
+        if len(pixels) >= 2:
             cv2.polylines(
                 image,
-                [points],
+                [pixels],
                 isClosed=False,
                 color=color,
                 thickness=thickness,
                 lineType=cv2.LINE_AA,
             )
-        angle = dash_end + gap_length_degrees
 
 
 def _draw_goal_frame(
@@ -301,88 +375,20 @@ def draw_court(
         padding,
     )
 
-    sideline_angle = degrees(asin(config.goal_top_y / config.free_throw_radius))
-    dash_length_px = max(1, config.free_throw_line_segment_length * scale)
-    gap_length_px = max(1, config.free_throw_line_gap_length * scale)
-    arc_dash_kwargs = {
-        "dash_length": config.free_throw_line_segment_length,
-        "gap_length": config.free_throw_line_gap_length,
-    }
-
-    _draw_dashed_arc(
-        court,
-        left_top_goal_center,
-        config.free_throw_radius,
-        360 - sideline_angle,
-        360,
-        bgr_line,
-        line_thickness,
-        scale,
-        padding,
-        **arc_dash_kwargs,
-    )
-    _draw_dashed_line(
-        court,
-        _to_pixel((config.free_throw_radius, config.goal_top_y), scale, padding),
-        _to_pixel((config.free_throw_radius, config.goal_bottom_y), scale, padding),
-        bgr_line,
-        line_thickness,
-        dash_length_px,
-        gap_length_px,
-    )
-    _draw_dashed_arc(
-        court,
-        left_bottom_goal_center,
-        config.free_throw_radius,
-        0,
-        sideline_angle,
-        bgr_line,
-        line_thickness,
-        scale,
-        padding,
-        **arc_dash_kwargs,
-    )
-    _draw_dashed_arc(
-        court,
-        right_top_goal_center,
-        config.free_throw_radius,
-        180,
-        180 + sideline_angle,
-        bgr_line,
-        line_thickness,
-        scale,
-        padding,
-        **arc_dash_kwargs,
-    )
-    _draw_dashed_line(
-        court,
-        _to_pixel(
-            (config.length - config.free_throw_radius, config.goal_top_y),
+    gap_px = config.free_throw_line_gap_length * scale
+    # A stroke thicker than the 15 cm gap fills the break and hides the marking.
+    free_throw_thickness = max(1, min(line_thickness, max(1, int(round(gap_px)) - 1)))
+    for side in ("left", "right"):
+        _draw_dashed_polyline(
+            court,
+            free_throw_polyline(config, side),
+            bgr_line,
+            free_throw_thickness,
             scale,
             padding,
-        ),
-        _to_pixel(
-            (config.length - config.free_throw_radius, config.goal_bottom_y),
-            scale,
-            padding,
-        ),
-        bgr_line,
-        line_thickness,
-        dash_length_px,
-        gap_length_px,
-    )
-    _draw_dashed_arc(
-        court,
-        right_bottom_goal_center,
-        config.free_throw_radius,
-        180 - sideline_angle,
-        180,
-        bgr_line,
-        line_thickness,
-        scale,
-        padding,
-        **arc_dash_kwargs,
-    )
+            config.free_throw_line_segment_length,
+            config.free_throw_line_gap_length,
+        )
 
     _draw_substitution_marks(
         court, config, bgr_line, line_thickness, scale, padding
@@ -518,3 +524,169 @@ def draw_paths_on_court(
             )
 
     return court
+
+
+def _project_points(
+    points: np.ndarray,
+    court_to_image: np.ndarray,
+) -> np.ndarray:
+    shaped = np.asarray(points, dtype=np.float32).reshape(-1, 1, 2)
+    projected = cv2.perspectiveTransform(shaped, court_to_image)
+    return projected.reshape(-1, 2)
+
+
+def _draw_projected_polyline(
+    image: np.ndarray,
+    points: np.ndarray,
+    color: Tuple[int, int, int],
+    thickness: int,
+) -> None:
+    if len(points) < 2:
+        return
+    pixels = np.round(points).astype(np.int32).reshape(-1, 1, 2)
+    cv2.polylines(
+        image,
+        [pixels],
+        isClosed=False,
+        color=color,
+        thickness=thickness,
+        lineType=cv2.LINE_AA,
+    )
+
+
+def draw_visible_court(
+    config: HandballCourtConfiguration,
+    polygon: np.ndarray,
+    camera_xy: Optional[Tuple[float, float]] = None,
+    color: sv.Color = sv.Color.from_hex("#FF9800"),
+    padding: int = 50,
+    scale: float = 0.1,
+    court: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Draw the floor the camera can see, and the camera when it fits.
+
+    ``polygon`` is the shooting range in court centimetres. Its boundary is
+    where the image border meets the floor.
+    """
+    if court is None:
+        court = draw_court(config=config, padding=padding, scale=scale)
+    points = np.asarray(polygon, dtype=np.float64).reshape(-1, 2)
+    if len(points) < 3:
+        return court
+
+    bgr = color.as_bgr()
+    pixels = np.array(
+        [_to_pixel((float(point[0]), float(point[1])), scale, padding) for point in points],
+        dtype=np.int32,
+    )
+    overlay = court.copy()
+    cv2.fillPoly(overlay, [pixels.reshape(-1, 1, 2)], bgr)
+    cv2.addWeighted(overlay, 0.28, court, 0.72, 0, court)
+    _draw_dashed_closed(court, pixels, bgr, max(2, int(round(4 * scale / 0.1))))
+
+    if camera_xy is not None:
+        camera_px = _to_pixel((float(camera_xy[0]), float(camera_xy[1])), scale, padding)
+        height, width = court.shape[:2]
+        if 0 <= camera_px[0] < width and 0 <= camera_px[1] < height:
+            cv2.circle(court, camera_px, 7, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(court, camera_px, 7, bgr, 2, cv2.LINE_AA)
+    return court
+
+
+def _draw_dashed_closed(
+    image: np.ndarray,
+    pixels: np.ndarray,
+    color: Tuple[int, int, int],
+    thickness: int,
+    dash: int = 10,
+    gap: int = 7,
+) -> None:
+    if len(pixels) < 2:
+        return
+    closed = np.vstack([pixels, pixels[:1]]).astype(np.float64)
+    for start, end in zip(closed[:-1], closed[1:]):
+        length = float(np.linalg.norm(end - start))
+        if length < 1.0:
+            continue
+        direction = (end - start) / length
+        cursor = 0.0
+        while cursor < length:
+            stop = min(cursor + dash, length)
+            p0 = start + direction * cursor
+            p1 = start + direction * stop
+            cv2.line(
+                image,
+                (int(round(p0[0])), int(round(p0[1]))),
+                (int(round(p1[0])), int(round(p1[1]))),
+                color,
+                thickness,
+                cv2.LINE_AA,
+            )
+            cursor = stop + gap
+
+
+def draw_projected_court(
+    image: np.ndarray,
+    config: HandballCourtConfiguration,
+    court_to_image: np.ndarray,
+    color: sv.Color = sv.Color.WHITE,
+    thickness: int = 2,
+) -> np.ndarray:
+    """Draw court markings warped by a court-to-image homography.
+
+    A calibration is accurate when these lines sit on the markings in the
+    frame. Arcs are sampled in court centimetres and then projected, because
+    a homography does not map circles to circles.
+    """
+    bgr = color.as_bgr()
+    for start, end in config.edges:
+        segment = _project_points(
+            [
+                config.vertices[start - 1],
+                config.vertices[end - 1],
+            ],
+            court_to_image,
+        )
+        _draw_projected_polyline(image, segment, bgr, thickness)
+
+    goal_arcs = (
+        ((0.0, config.goal_top_y), 270.0, 360.0),
+        ((0.0, config.goal_bottom_y), 0.0, 90.0),
+        ((float(config.length), config.goal_top_y), 180.0, 270.0),
+        ((float(config.length), config.goal_bottom_y), 90.0, 180.0),
+    )
+    for center, start_angle, end_angle in goal_arcs:
+        arc = _sample_arc(
+            center,
+            config.goal_area_radius,
+            start_angle,
+            end_angle,
+        )
+        _draw_projected_polyline(
+            image,
+            _project_points(arc, court_to_image),
+            bgr,
+            thickness,
+        )
+
+    for side in ("left", "right"):
+        _draw_projected_polyline(
+            image,
+            _project_points(free_throw_polyline(config, side), court_to_image),
+            bgr,
+            thickness,
+        )
+
+    throw_off = _sample_arc(
+        (config.center_x, config.center_y),
+        config.throw_off_area_radius,
+        0.0,
+        360.0,
+    )
+    _draw_projected_polyline(
+        image,
+        _project_points(throw_off, court_to_image),
+        bgr,
+        thickness,
+    )
+    return image

@@ -3,7 +3,7 @@ import os
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -22,9 +22,22 @@ from sports.annotators.handball import (
     draw_court,
     draw_paths_on_court,
     draw_points_on_court,
+    draw_projected_court,
+    draw_visible_court,
 )
-from sports.common.view import ViewTransformer
+from sports.handball.camera import camera_from_homography, visible_court_polygon
 from sports.configs.handball import HandballCourtConfiguration
+from sports.handball.ball import HandballBallTracker
+from sports.handball.calibration import CourtCalibrator
+from sports.handball.roster import (
+    FIELD_PLAYER,
+    GOALKEEPER,
+    REFEREE,
+    HandballRoster,
+    JerseyColorTeams,
+    normalize_kind,
+    torso_colors,
+)
 
 
 PARENT_DIR = str(CURRENT_DIR)
@@ -65,6 +78,10 @@ BALL_ANNOTATOR = sv.CircleAnnotator(
     color=sv.Color.from_hex(TEAM_COLORS[2]),
     thickness=2,
 )
+PLAYER_CONFIDENCE_THRESHOLD = 0.35
+RADAR_PADDING = 100
+RADAR_SCALE = 0.1
+READOUT_FONT = "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"
 
 
 class Mode(Enum):
@@ -104,25 +121,21 @@ def labels_from_result(result) -> List[str]:
     return [names[class_id] for class_id in detections.class_id]
 
 
-def detection_class_ids(result, class_names: Set[str]) -> List[int]:
-    return [
-        class_id
-        for class_id, class_name in result.names.items()
-        if class_name.lower() in class_names
-    ]
-
-
-def keypoint_correspondences(
+def keypoint_inputs(
     keypoints: sv.KeyPoints,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    court_vertices = np.array(CONFIG.vertices, dtype=np.float32)
-    detected_xy = keypoints.xy[0].astype(np.float32)
-    point_count = min(len(detected_xy), len(court_vertices))
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    if len(keypoints) == 0 or keypoints.xy.size == 0:
+        return np.zeros((0, 2), dtype=np.float32), None
 
-    source = detected_xy[:point_count]
-    target = court_vertices[:point_count]
-    mask = (source[:, 0] > 1) & (source[:, 1] > 1)
-    return source[mask], target[mask], mask
+    best = 0
+    if keypoints.keypoint_confidence is not None and len(keypoints) > 1:
+        visible = keypoints.keypoint_confidence >= PLAYER_CONFIDENCE_THRESHOLD
+        best = int(np.argmax(visible.sum(axis=1)))
+
+    confidence = None
+    if keypoints.keypoint_confidence is not None:
+        confidence = keypoints.keypoint_confidence[best]
+    return keypoints.xy[best], confidence
 
 
 def write_video(
@@ -219,18 +232,30 @@ def run_court_detection(
 ) -> Iterator[np.ndarray]:
     court_detection_model = YOLO(model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    calibrator = CourtCalibrator(np.array(CONFIG.vertices, dtype=np.float32))
 
     for frame in frame_generator:
         result = court_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(result)
-        label_count = min(len(CONFIG.labels), keypoints.xy.shape[1])
+        label_count = min(len(CONFIG.labels), keypoints.xy.shape[1] if keypoints.xy.ndim == 3 else 0)
+        image_xy, confidence = keypoint_inputs(keypoints)
+        projection = calibrator.update(image_xy, confidence)
 
         annotated_frame = frame.copy()
-        annotated_frame = VERTEX_LABEL_ANNOTATOR.annotate(
-            annotated_frame,
-            keypoints,
-            CONFIG.labels[:label_count],
-        )
+        if len(keypoints) > 0:
+            annotated_frame = VERTEX_LABEL_ANNOTATOR.annotate(
+                annotated_frame,
+                keypoints,
+                CONFIG.labels[:label_count],
+            )
+        if projection is not None:
+            annotated_frame = draw_projected_court(
+                annotated_frame,
+                CONFIG,
+                projection.court_to_image,
+                color=sv.Color.from_hex("#00FF87"),
+                thickness=2,
+            )
         yield annotated_frame
 
 
@@ -262,18 +287,48 @@ def run_ball_detection(
 ) -> Iterator[np.ndarray]:
     ball_detection_model = YOLO(model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    ball_tracker = HandballBallTracker()
+
+    def callback(image_slice: np.ndarray) -> sv.Detections:
+        result = ball_detection_model(image_slice, imgsz=640, verbose=False)[0]
+        return sv.Detections.from_ultralytics(result)
+
+    slicer = sv.InferenceSlicer(
+        callback=callback,
+        overlap_filter=sv.OverlapFilter.NONE,
+        slice_wh=(640, 640),
+    )
 
     for frame in frame_generator:
-        result = ball_detection_model(frame, imgsz=1280, verbose=False)[0]
-        detections = sv.Detections.from_ultralytics(result)
-        labels = labels_from_result(result)
+        detections = slicer(frame).with_nms(threshold=0.1)
+        detections = ball_tracker.update_detections(detections)
 
         annotated_frame = frame.copy()
         annotated_frame = BALL_ANNOTATOR.annotate(annotated_frame, detections)
-        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels=labels
-        )
         yield annotated_frame
+
+
+def _draw_readout(image: np.ndarray, text: str) -> np.ndarray:
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+
+        font = ImageFont.truetype(READOUT_FONT, 28)
+    except (ImportError, OSError):
+        return image
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    canvas = Image.fromarray(rgb)
+    ImageDraw.Draw(canvas).text((24, 16), text, font=font, fill=(255, 255, 255))
+    return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+
+
+def _track_label(track) -> str:
+    if track.kind == GOALKEEPER:
+        prefix = "GK"
+    elif track.kind == REFEREE:
+        prefix = "Ref"
+    else:
+        prefix = "P"
+    return f"{prefix}{track.track_id}"
 
 
 def run_radar(
@@ -285,50 +340,129 @@ def run_radar(
     player_detection_model = YOLO(player_model_path).to(device=device)
     court_detection_model = YOLO(court_model_path).to(device=device)
     frame_generator = sv.get_video_frames_generator(source_path=source_video_path)
+    calibrator = CourtCalibrator(np.array(CONFIG.vertices, dtype=np.float32))
+    roster = HandballRoster(CONFIG)
+    jerseys = JerseyColorTeams()
 
     for frame in frame_generator:
         court_result = court_detection_model(frame, verbose=False)[0]
         keypoints = sv.KeyPoints.from_ultralytics(court_result)
-        source, target, _ = keypoint_correspondences(keypoints)
+        image_xy, confidence = keypoint_inputs(keypoints)
+        projection = calibrator.update(image_xy, confidence)
 
         player_result = player_detection_model(frame, imgsz=1280, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(player_result)
-        labels = labels_from_result(player_result)
+        if detections.confidence is not None:
+            detections = detections[detections.confidence >= PLAYER_CONFIDENCE_THRESHOLD]
 
         annotated_frame = frame.copy()
-        annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
-        annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
-            annotated_frame, detections, labels=labels
-        )
-
-        if len(source) < 4:
+        if projection is None:
+            if len(detections):
+                labels = [
+                    player_result.names[class_id] for class_id in detections.class_id
+                ]
+                annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, detections)
+                annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+                    annotated_frame, detections, labels=labels
+                )
             yield annotated_frame
             continue
 
-        player_class_ids = detection_class_ids(
-            player_result, {"player", "goalkeeper"}
-        )
-        player_mask = np.isin(detections.class_id, player_class_ids)
-        players = detections[player_mask]
-        if len(players) == 0:
-            yield annotated_frame
-            continue
+        if len(detections) == 0:
+            kinds = []
+            teams = np.zeros((0,), dtype=int)
+            scores = np.zeros((0,), dtype=np.float64)
+            feet_court = np.zeros((0, 2), dtype=np.float64)
+            boxes = np.zeros((0, 4), dtype=np.float64)
+        else:
+            kinds = [
+                normalize_kind(player_result.names[int(class_id)])
+                for class_id in detections.class_id
+            ]
+            feet_image = detections.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
+            feet_court = projection.transform_points(points=feet_image)
+            boxes = detections.xyxy
+            if detections.confidence is None:
+                scores = np.ones(len(detections), dtype=np.float64)
+            else:
+                scores = np.asarray(detections.confidence, dtype=np.float64)
+            colors = torso_colors(frame, boxes)
+            field_colors = [
+                colors[index]
+                for index, kind in enumerate(kinds)
+                if kind == FIELD_PLAYER
+            ]
+            if field_colors:
+                jerseys.observe(np.stack(field_colors))
+            teams = jerseys.assign(colors)
+            for index, kind in enumerate(kinds):
+                if kind == REFEREE:
+                    teams[index] = -1
 
-        transformer = ViewTransformer(source=source, target=target)
-        xy = players.get_anchors_coordinates(anchor=sv.Position.BOTTOM_CENTER)
-        transformed_xy = transformer.transform_points(points=xy)
-
-        radar = draw_court(config=CONFIG)
-        radar = draw_points_on_court(
-            config=CONFIG,
-            xy=transformed_xy,
-            face_color=sv.Color.from_hex(TEAM_COLORS[0]),
-            edge_color=sv.Color.WHITE,
-            radius=16,
-            court=radar,
+        tracks = roster.update(
+            xyxy=boxes,
+            confidence=scores,
+            kind=kinds,
+            team_id=teams,
+            foot_court=feet_court,
+            court_to_image=projection.court_to_image,
         )
+        visible = [track for track in tracks if track.confirmed or track.hits >= 2]
+        if visible:
+            boxes = np.stack([track.xyxy for track in visible]).astype(np.float32)
+            roster_detections = sv.Detections(
+                xyxy=boxes,
+                confidence=np.array([track.confidence for track in visible], dtype=np.float32),
+                class_id=np.array([
+                    track.team_id if track.team_id >= 0 else 2 for track in visible
+                ]),
+            )
+            annotated_frame = BOX_ANNOTATOR.annotate(annotated_frame, roster_detections)
+            annotated_frame = BOX_LABEL_ANNOTATOR.annotate(
+                annotated_frame,
+                roster_detections,
+                labels=[_track_label(track) for track in visible],
+            )
 
         h, w, _ = frame.shape
+        radar = draw_court(config=CONFIG, padding=RADAR_PADDING, scale=RADAR_SCALE)
+        try:
+            camera_pose = camera_from_homography(projection.court_to_image, (w, h))
+        except ValueError:
+            camera_pose = None
+        shooting_range = visible_court_polygon(
+            projection.court_to_image, (w, h), CONFIG
+        )
+        if len(shooting_range) >= 3:
+            radar = draw_visible_court(
+                config=CONFIG,
+                polygon=shooting_range,
+                camera_xy=None if camera_pose is None else (camera_pose.x_cm, camera_pose.y_cm),
+                padding=RADAR_PADDING,
+                scale=RADAR_SCALE,
+                court=radar,
+            )
+        for team_id, color in ((0, TEAM_COLORS[0]), (1, TEAM_COLORS[1])):
+            points = [
+                track.foot_court
+                for track in visible
+                if track.team_id == team_id and track.kind != REFEREE
+            ]
+            if not points:
+                continue
+            radar = draw_points_on_court(
+                config=CONFIG,
+                xy=np.array(points, dtype=np.float32),
+                face_color=sv.Color.from_hex(color),
+                edge_color=sv.Color.WHITE,
+                radius=16,
+                padding=RADAR_PADDING,
+                scale=RADAR_SCALE,
+                court=radar,
+            )
+        if camera_pose is not None:
+            shown = sum(1 for track in visible if track.kind != REFEREE)
+            annotated_frame = _draw_readout(annotated_frame, camera_pose.readout(shown))
         radar = sv.resize_image(radar, (w // 2, h // 2))
         radar_h, radar_w, _ = radar.shape
         rect = sv.Rect(
