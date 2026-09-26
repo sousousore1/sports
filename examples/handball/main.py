@@ -3,7 +3,7 @@ import os
 import sys
 from enum import Enum
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -114,14 +114,6 @@ def labels_from_result(result) -> List[str]:
     detections = sv.Detections.from_ultralytics(result)
     names = result.names
     return [names[class_id] for class_id in detections.class_id]
-
-
-def detection_class_ids(result, class_names: Set[str]) -> List[int]:
-    return [
-        class_id
-        for class_id, class_name in result.names.items()
-        if class_name.lower() in class_names
-    ]
 
 
 def keypoint_inputs(

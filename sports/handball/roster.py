@@ -394,6 +394,12 @@ class HandballRoster:
     def _near_substitution(self, foot: np.ndarray) -> bool:
         return float(distance_to_segments(foot, self.segments)[0]) <= self.substitution_gate_cm
 
+    def _plausible_goalkeeper(self, foot: np.ndarray) -> bool:
+        """A goalkeeper stands in front of a goal, not at centre court."""
+        reach = float(self.config.goal_area_radius) + 300.0
+        x = float(foot[0])
+        return x <= reach or x >= float(self.config.length) - reach
+
     def _left_through_substitution(self, foot: np.ndarray) -> bool:
         """True when a foot has crossed a sideline inside the substitution zone.
 
@@ -434,7 +440,12 @@ class HandballRoster:
         track.hits += 1
         track.missed = 0
         track.mean_confidence += (score - track.mean_confidence) / track.hits
-        if kind != REFEREE and track.kind != REFEREE and kind == GOALKEEPER:
+        if (
+            kind == GOALKEEPER
+            and track.kind == FIELD_PLAYER
+            and self._plausible_goalkeeper(foot)
+            and self._team_counts(track.team_id)[1] == 0
+        ):
             track.kind = GOALKEEPER
         if track.hits >= self.confirm_hits:
             track.confirmed = True
@@ -483,6 +494,8 @@ class HandballRoster:
     ) -> None:
         if not self._inside(foot) and kind == REFEREE:
             return
+        if kind == GOALKEEPER and not self._plausible_goalkeeper(foot):
+            kind = FIELD_PLAYER
         resolved_team = self._resolve_team(team, kind)
         if kind != REFEREE:
             opening = self.frame_index < self.warmup_frames

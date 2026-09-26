@@ -83,7 +83,7 @@ class HandballRosterTest(unittest.TestCase):
     def test_each_team_keeps_six_field_players_and_one_goalkeeper(self):
         roster = self._roster()
         feet = [[400.0 + index * 300.0, 700.0] for index in range(7)]
-        feet.append([2200.0, 400.0])  # goalkeeper
+        feet.append([500.0, 1000.0])  # goalkeeper, in front of the goal
         teams = [0] * 8
         kinds = [FIELD_PLAYER] * 7 + [GOALKEEPER]
         scores = [0.95 - index * 0.05 for index in range(7)] + [0.9]
@@ -148,6 +148,24 @@ class HandballRosterTest(unittest.TestCase):
                 break
         self.assertFalse(any(track.team_id == 1 for track in tracks))
         self.assertTrue(any(track.team_id == 0 for track in tracks))
+
+    def test_a_centre_court_goalkeeper_label_does_not_add_a_second_goalkeeper(self):
+        roster = self._roster(warmup_frames=2, confirm_hits=1)
+        _feed(
+            roster,
+            [[450.0, 1000.0], [2000.0, 1000.0]],
+            [0, 0],
+            [GOALKEEPER, GOALKEEPER],
+        )
+        tracks = _feed(
+            roster,
+            [[450.0, 1000.0], [2000.0, 1000.0]],
+            [0, 0],
+            [GOALKEEPER, GOALKEEPER],
+        )
+        goalkeepers = [track for track in tracks if track.kind == GOALKEEPER and track.team_id == 0]
+        self.assertEqual(len(goalkeepers), 1)
+        self.assertLess(goalkeepers[0].foot_court[0], 900.0)
 
     def test_a_full_team_rejects_another_substitution(self):
         roster = self._roster(warmup_frames=1, confirm_hits=1)
