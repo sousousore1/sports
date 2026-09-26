@@ -106,6 +106,9 @@ celerybeat.pid
 # SageMath parsed files
 *.sage.py
 
+# Soccer example downloaded models/videos (fetched via examples/soccer/setup.sh)
+examples/soccer/data/
+
 # Environments
 .env
 .venv

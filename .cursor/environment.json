@@ -1,0 +1,5 @@
+{
+  "name": "sports (Roboflow soccer AI)",
+  "user": "ubuntu",
+  "install": "bash .cursor/install.sh"
+}
